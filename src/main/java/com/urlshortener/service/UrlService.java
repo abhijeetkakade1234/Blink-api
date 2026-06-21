@@ -2,6 +2,7 @@ package com.urlshortener.service;
 
 import com.urlshortener.dto.CreateShortUrlRequest;
 import com.urlshortener.dto.CreateShortUrlResponse;
+import com.urlshortener.dto.UrlListResponse;
 import com.urlshortener.dto.UrlStatsResponse;
 import com.urlshortener.dto.UrlSummaryResponse;
 import com.urlshortener.entity.ClickEvent;
@@ -21,6 +22,10 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -59,6 +64,24 @@ public class UrlService {
     mapping.setExpiresAt(request.expiresAt());
 
     UrlMapping saved = urlMappingRepository.save(mapping);
+    cacheMapping(saved);
+    return toCreateResponse(saved);
+  }
+
+  @Transactional
+  public CreateShortUrlResponse updateUrl(UUID id, CreateShortUrlRequest request) {
+    UrlMapping mapping =
+        urlMappingRepository.findById(id).orElseThrow(() -> new NotFoundException("url not found"));
+    String previousShortCode = mapping.getShortCode();
+
+    mapping.setOriginalUrl(normalizeUrl(request.url()));
+    mapping.setShortCode(resolveUpdatedShortCode(mapping, request.customAlias()));
+    mapping.setExpiresAt(request.expiresAt());
+
+    UrlMapping saved = urlMappingRepository.save(mapping);
+    if (!previousShortCode.equals(saved.getShortCode())) {
+      deleteCacheKey(previousShortCode);
+    }
     cacheMapping(saved);
     return toCreateResponse(saved);
   }
@@ -114,11 +137,31 @@ public class UrlService {
   }
 
   @Transactional(readOnly = true)
-  public List<UrlSummaryResponse> listUrls() {
-    return urlMappingRepository.findAll().stream()
-        .sorted((left, right) -> right.getCreatedAt().compareTo(left.getCreatedAt()))
-        .map(this::toSummaryResponse)
-        .toList();
+  public UrlListResponse listUrls(int page, int size, String query) {
+    int safePage = Math.max(page, 1);
+    int safeSize = Math.min(Math.max(size, 1), 100);
+    Pageable pageable =
+        PageRequest.of(safePage - 1, safeSize, Sort.by(Sort.Direction.DESC, "createdAt"));
+    Page<UrlMapping> resultPage;
+
+    if (query == null || query.isBlank()) {
+      resultPage = urlMappingRepository.findAll(pageable);
+    } else {
+      String trimmedQuery = query.trim();
+      resultPage =
+          urlMappingRepository.findByOriginalUrlContainingIgnoreCaseOrShortCodeContainingIgnoreCase(
+              trimmedQuery, trimmedQuery, pageable);
+    }
+
+    List<UrlSummaryResponse> items =
+        resultPage.getContent().stream().map(this::toSummaryResponse).toList();
+
+    return new UrlListResponse(
+        items,
+        safePage,
+        safeSize,
+        resultPage.getTotalElements(),
+        Math.max(resultPage.getTotalPages(), 1));
   }
 
   @Transactional
@@ -128,7 +171,14 @@ public class UrlService {
     urlMappingRepository.delete(mapping);
 
     try {
-      redisTemplate.delete(cacheKey(mapping.getShortCode()));
+      deleteCacheKey(mapping.getShortCode());
+    } catch (Exception ignored) {
+    }
+  }
+
+  private void deleteCacheKey(String shortCode) {
+    try {
+      redisTemplate.delete(cacheKey(shortCode));
     } catch (Exception ignored) {
     }
   }
@@ -162,6 +212,22 @@ public class UrlService {
       code = randomCode(6);
     } while (urlMappingRepository.existsByShortCode(code));
     return code;
+  }
+
+  private String resolveUpdatedShortCode(UrlMapping existingMapping, String customAlias) {
+    if (customAlias == null || customAlias.isBlank()) {
+      return existingMapping.getShortCode();
+    }
+
+    String trimmed = customAlias.trim();
+    if (!trimmed.matches("[A-Za-z0-9_-]+")) {
+      throw new BadRequestException("customAlias contains invalid characters");
+    }
+    if (!trimmed.equals(existingMapping.getShortCode())
+        && urlMappingRepository.existsByShortCode(trimmed)) {
+      throw new BadRequestException("customAlias already exists");
+    }
+    return trimmed;
   }
 
   private String normalizeUrl(String url) {
