@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: blink-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /actuator/health
+    autoDeploy: true
+    envVars:
+      - key: SERVER_PORT
+        value: "8080"
+      - key: APP_BASE_URL
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: blink-db
+          property: connectionString
+      - key: DATABASE_USERNAME
+        fromDatabase:
+          name: blink-db
+          property: user
+      - key: DATABASE_PASSWORD
+        fromDatabase:
+          name: blink-db
+          property: password
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: blink-cache
+          property: connectionString
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: "30"
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+databases:
+  - name: blink-db
+    plan: free
+
+keyvalue:
+  - name: blink-cache
+    plan: free
